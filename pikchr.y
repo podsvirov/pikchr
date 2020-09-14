@@ -3798,10 +3798,7 @@ static void pik_render(Pik *p, PEList *pEList){
       pik_append(p, "<metadata>\n", 11);
       pik_append(p, "<pikchr:PIKCHR xmlns:pikchr="
                  "\"https://pikchr.org/svg-metadata-v1\">\n", -1);
-      pik_append(p, "<pikchr:src class=\"pikchr-src\"><![CDATA[", 40)
-      /* ^^^ class=... is a bit of a hack to enable querying of that
-         element via JS's document.querySelector(), which does not seem
-         to be able to select namespace-qualified nodes by name. */;
+      pik_append(p, "<pikchr:src><![CDATA[", 21);
       pik_append(p, p->zIn, (int)p->nIn);
       pik_append(p, "]]></pikchr:src>\n", 17);
       pik_append(p, "</pikchr:PIKCHR>\n", 17);
