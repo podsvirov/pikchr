@@ -318,6 +318,7 @@ struct PObj {
   int inDir, outDir;       /* Entry and exit directions */
   int nPath;               /* Number of path points */
   PPoint *aPath;           /* Array of path points */
+  PObj *pFrom, *pTo;       /* End-point objects of a path */
   PBox bbox;               /* Bounding box */
 };
 
@@ -348,6 +349,7 @@ struct Pik {
   unsigned char eDir;      /* Current direction */
   unsigned int mFlags;     /* Flags passed to pikchr() */
   PObj *cur;               /* Object under construction */
+  PObj *lastRef;           /* Last object references by name */
   PList *list;             /* Object list under construction */
   PMacro *pMacros;         /* List of all defined macros */
   PVar *pVar;              /* Application-defined variables */
@@ -427,8 +429,10 @@ static PList *pik_elist_append(Pik*,PList*,PObj*);
 static PObj *pik_elem_new(Pik*,PToken*,PToken*,PList*);
 static void pik_set_direction(Pik*,int);
 static void pik_elem_setname(Pik*,PObj*,PToken*);
+static int pik_round(PNum);
 static void pik_set_var(Pik*,PToken*,PNum,PToken*);
 static PNum pik_value(Pik*,const char*,int,int*);
+static int pik_value_int(Pik*,const char*,int,int*);
 static PNum pik_lookup_color(Pik*,PToken*);
 static PNum pik_get_var(Pik*,PToken*);
 static PNum pik_atof(PToken*);
@@ -451,6 +455,7 @@ static PObj *pik_find_nth(Pik*,PObj*,PToken*);
 static PObj *pik_find_byname(Pik*,PObj*,PToken*);
 static PPoint pik_place_of_elem(Pik*,PObj*,PToken*);
 static int pik_bbox_isempty(PBox*);
+static int pik_bbox_contains_point(PBox*,PPoint*);
 static void pik_bbox_init(PBox*);
 static void pik_bbox_addbox(PBox*,PBox*);
 static void pik_bbox_add_xy(PBox*,PNum,PNum);
@@ -1205,7 +1210,7 @@ static PPoint circleChop(Pik *p, PObj *pObj, PPoint *pPt){
   PNum dx = pPt->x - pObj->ptAt.x;
   PNum dy = pPt->y - pObj->ptAt.y;
   PNum dist = hypot(dx,dy);
-  if( dist<pObj->rad ) return pObj->ptAt;
+  if( dist<pObj->rad || dist<=0 ) return pObj->ptAt;
   chop.x = pObj->ptAt.x + dx*pObj->rad/dist;
   chop.y = pObj->ptAt.y + dy*pObj->rad/dist;
   UNUSED_PARAMETER(p);
@@ -1904,7 +1909,7 @@ static void pik_append(Pik *p, const char *zText, int n){
       return;
     }
     p->zOut = z;
-    p->nOutAlloc = n;
+    p->nOutAlloc = nNew;
   }
   memcpy(p->zOut+p->nOut, zText, n);
   p->nOut += n;
@@ -2030,14 +2035,14 @@ static int pik_color_to_dark_mode(int x, int isBg){
 static void pik_append_x(Pik *p, const char *z1, PNum v, const char *z2){
   char buf[200];
   v -= p->bbox.sw.x;
-  snprintf(buf, sizeof(buf)-1, "%s%d%s", z1, (int)(p->rScale*v), z2);
+  snprintf(buf, sizeof(buf)-1, "%s%d%s", z1, pik_round(p->rScale*v), z2);
   buf[sizeof(buf)-1] = 0;
   pik_append(p, buf, -1);
 }
 static void pik_append_y(Pik *p, const char *z1, PNum v, const char *z2){
   char buf[200];
   v = p->bbox.ne.y - v;
-  snprintf(buf, sizeof(buf)-1, "%s%d%s", z1, (int)(p->rScale*v), z2);
+  snprintf(buf, sizeof(buf)-1, "%s%d%s", z1, pik_round(p->rScale*v), z2);
   buf[sizeof(buf)-1] = 0;
   pik_append(p, buf, -1);
 }
@@ -2046,7 +2051,7 @@ static void pik_append_xy(Pik *p, const char *z1, PNum x, PNum y){
   x = x - p->bbox.sw.x;
   y = p->bbox.ne.y - y;
   snprintf(buf, sizeof(buf)-1, "%s%d,%d", z1,
-       (int)(p->rScale*x), (int)(p->rScale*y));
+       pik_round(p->rScale*x), pik_round(p->rScale*y));
   buf[sizeof(buf)-1] = 0;
   pik_append(p, buf, -1);
 }
@@ -2066,7 +2071,7 @@ static void pik_append_dis(Pik *p, const char *z1, PNum v, const char *z2){
 */
 static void pik_append_clr(Pik *p,const char *z1,PNum v,const char *z2,int bg){
   char buf[200];
-  int x = (int)v;
+  int x = pik_round(v);
   int r, g, b;
   if( x==0 && p->fgcolor>0 && !bg ){
     x = p->fgcolor;
@@ -2092,8 +2097,8 @@ static void pik_append_arc(Pik *p, PNum r1, PNum r2, PNum x, PNum y){
   x = x - p->bbox.sw.x;
   y = p->bbox.ne.y - y;
   snprintf(buf, sizeof(buf)-1, "A%d %d 0 0 0 %d %d", 
-     (int)(p->rScale*r1), (int)(p->rScale*r2),
-     (int)(p->rScale*x), (int)(p->rScale*y));
+     pik_round(p->rScale*r1), pik_round(p->rScale*r2),
+     pik_round(p->rScale*x), pik_round(p->rScale*y));
   buf[sizeof(buf)-1] = 0;
   pik_append(p, buf, -1);
 }
@@ -2636,6 +2641,17 @@ static int pik_bbox_isempty(PBox *p){
   return p->sw.x>p->ne.x;
 }
 
+/* Return true if point pPt is contained within the bounding box pBox
+*/
+static int pik_bbox_contains_point(PBox *pBox, PPoint *pPt){
+  if( pik_bbox_isempty(pBox) ) return 0;
+  if( pPt->x < pBox->sw.x ) return 0;
+  if( pPt->x > pBox->ne.x ) return 0;
+  if( pPt->y < pBox->sw.y ) return 0;
+  if( pPt->y > pBox->ne.y ) return 0;
+  return 1;
+}
+
 /* Initialize a bounding box to an empty container
 */
 static void pik_bbox_init(PBox *p){
@@ -2785,7 +2801,7 @@ static PObj *pik_elem_new(Pik *p, PToken *pId, PToken *pStr,PList *pSublist){
   p->aTPath[0] = pNew->ptAt;
   pNew->with = pNew->ptAt;
   pNew->outDir = pNew->inDir = p->eDir;
-  pNew->iLayer = (int)pik_value(p, "layer", 5, &miss);
+  pNew->iLayer = pik_value_int(p, "layer", 5, &miss);
   if( miss ) pNew->iLayer = 1000;
   if( pNew->iLayer<0 ) pNew->iLayer = 0;
   if( pSublist ){
@@ -3232,6 +3248,34 @@ static void pik_evenwith(Pik *p, PToken *pDir, PPoint *pPlace){
   pObj->outDir = pDir->eCode;
 }
 
+/* If the last referenced object is centered at point pPt then return
+** a pointer to that object.  If there is no prior object reference,
+** or if the points are not the same, return NULL.
+**
+** This is a side-channel hack used to find the objects at which a
+** line begins and ends.  For example, in
+**
+**        arrow from OBJ1 to OBJ2 chop
+**
+** The arrow object is normally just handed the coordinates of the
+** centers for OBJ1 and OBJ2.  But we also want to know the specific
+** object named in case there are multiple objects centered at the
+** same point.
+**
+** See forum post 1d46e3a0bc
+*/
+static PObj *pik_last_ref_object(Pik *p, PPoint *pPt){
+  PObj *pRes = 0;
+  if( p->lastRef==0 ) return 0;
+  if( p->lastRef->ptAt.x==pPt->x
+   && p->lastRef->ptAt.y==pPt->y
+  ){
+    pRes = p->lastRef;
+  }
+  p->lastRef = 0;
+  return pRes;
+}
+
 /* Set the "from" of an object
 */
 static void pik_set_from(Pik *p, PObj *pObj, PToken *pTk, PPoint *pPt){
@@ -3259,6 +3303,7 @@ static void pik_set_from(Pik *p, PObj *pObj, PToken *pTk, PPoint *pPt){
   p->aTPath[0] = *pPt;
   p->mTPath = 3;
   pObj->mProp |= A_FROM;
+  pObj->pFrom = pik_last_ref_object(p, pPt);
 }
 
 /* Set the "to" of an object
@@ -3279,6 +3324,7 @@ static void pik_add_to(Pik *p, PObj *pObj, PToken *pTk, PPoint *pPt){
   }
   p->aTPath[n] = *pPt;
   p->mTPath = 3;
+  pObj->pTo = pik_last_ref_object(p, pPt);
 }
 
 static void pik_close_path(Pik *p, PToken *pErr){
@@ -3616,6 +3662,16 @@ static void pik_set_var(Pik *p, PToken *pId, PNum val, PToken *pOp){
 }
 
 /*
+** Round a PNum into the nearest integer
+*/
+static int pik_round(PNum v){
+  if( isnan(v) ) return 0;
+  if( v < -2147483647 ) return -2147483648;
+  if( v >= 2147483647 ) return 2147483647;
+  return (int)v;
+}
+
+/*
 ** Search for the variable named z[0..n-1] in:
 **
 **   * Application defined variables
@@ -3652,6 +3708,9 @@ static PNum pik_value(Pik *p, const char *z, int n, int *pMiss){
   }
   if( pMiss ) *pMiss = 1;
   return 0.0;
+}
+static int pik_value_int(Pik *p, const char *z, int n, int *pMiss){
+  return pik_round(pik_value(p,z,n,pMiss));
 }
 
 /*
@@ -3807,6 +3866,7 @@ static PObj *pik_find_byname(Pik *p, PObj *pBasis, PToken *pName){
   for(i=pList->n-1; i>=0; i--){
     PObj *pObj = pList->a[i];
     if( pObj->zName && pik_token_eq(pName,pObj->zName)==0 ){
+      p->lastRef = pObj;
       return pObj;
     }
   }
@@ -3817,6 +3877,7 @@ static PObj *pik_find_byname(Pik *p, PObj *pBasis, PToken *pName){
     for(j=0; j<pObj->nTxt; j++){
       if( pObj->aTxt[j].n==pName->n+2
        && memcmp(pObj->aTxt[j].z+1,pName->z,pName->n)==0 ){
+        p->lastRef = pObj;
         return pObj;
       }
     }
@@ -3951,22 +4012,24 @@ static PPoint pik_nth_vertex(Pik *p, PToken *pNth, PToken *pErr, PObj *pObj){
 */
 static PNum pik_property_of(PObj *pObj, PToken *pProp){
   PNum v = 0.0;
-  switch( pProp->eType ){
-    case T_HEIGHT:    v = pObj->h;            break;
-    case T_WIDTH:     v = pObj->w;            break;
-    case T_RADIUS:    v = pObj->rad;          break;
-    case T_DIAMETER:  v = pObj->rad*2.0;      break;
-    case T_THICKNESS: v = pObj->sw;           break;
-    case T_DASHED:    v = pObj->dashed;       break;
-    case T_DOTTED:    v = pObj->dotted;       break;
-    case T_FILL:      v = pObj->fill;         break;
-    case T_COLOR:     v = pObj->color;        break;
-    case T_X:         v = pObj->ptAt.x;       break;
-    case T_Y:         v = pObj->ptAt.y;       break;
-    case T_TOP:       v = pObj->bbox.ne.y;    break;
-    case T_BOTTOM:    v = pObj->bbox.sw.y;    break;
-    case T_LEFT:      v = pObj->bbox.sw.x;    break;
-    case T_RIGHT:     v = pObj->bbox.ne.x;    break;
+  if( pObj ){
+    switch( pProp->eType ){
+      case T_HEIGHT:    v = pObj->h;            break;
+      case T_WIDTH:     v = pObj->w;            break;
+      case T_RADIUS:    v = pObj->rad;          break;
+      case T_DIAMETER:  v = pObj->rad*2.0;      break;
+      case T_THICKNESS: v = pObj->sw;           break;
+      case T_DASHED:    v = pObj->dashed;       break;
+      case T_DOTTED:    v = pObj->dotted;       break;
+      case T_FILL:      v = pObj->fill;         break;
+      case T_COLOR:     v = pObj->color;        break;
+      case T_X:         v = pObj->ptAt.x;       break;
+      case T_Y:         v = pObj->ptAt.y;       break;
+      case T_TOP:       v = pObj->bbox.ne.y;    break;
+      case T_BOTTOM:    v = pObj->bbox.sw.y;    break;
+      case T_LEFT:      v = pObj->bbox.sw.x;    break;
+      case T_RIGHT:     v = pObj->bbox.ne.x;    break;
+    }
   }
   return v;
 }
@@ -4012,10 +4075,12 @@ static void pik_elem_setname(Pik *p, PObj *pObj, PToken *pName){
 }
 
 /*
-** Search for object located at *pCenter that has an xChop method.
+** Search for object located at *pCenter that has an xChop method and
+** that does not enclose point pOther.
+**
 ** Return a pointer to the object, or NULL if not found.
 */
-static PObj *pik_find_chopper(PList *pList, PPoint *pCenter){
+static PObj *pik_find_chopper(PList *pList, PPoint *pCenter, PPoint *pOther){
   int i;
   if( pList==0 ) return 0;
   for(i=pList->n-1; i>=0; i--){
@@ -4023,10 +4088,11 @@ static PObj *pik_find_chopper(PList *pList, PPoint *pCenter){
     if( pObj->type->xChop!=0
      && pObj->ptAt.x==pCenter->x
      && pObj->ptAt.y==pCenter->y
+     && !pik_bbox_contains_point(&pObj->bbox, pOther)
     ){
       return pObj;
     }else if( pObj->pSublist ){
-      pObj = pik_find_chopper(pObj->pSublist,pCenter);
+      pObj = pik_find_chopper(pObj->pSublist,pCenter,pOther);
       if( pObj ) return pObj;
     }
   }
@@ -4036,12 +4102,18 @@ static PObj *pik_find_chopper(PList *pList, PPoint *pCenter){
 /*
 ** There is a line traveling from pFrom to pTo.
 **
-** If point pTo is the exact enter of a choppable object,
-** then adjust pTo by the appropriate amount in the direction
-** of pFrom.
+** If pObj is not null and is a choppable object, then chop at
+** the boundary of pObj - where the line crosses the boundary
+** of pObj.
+**
+** If pObj is NULL or has no xChop method, then search for some
+** other object centered at pTo that is choppable and use it
+** instead.
 */
-static void pik_autochop(Pik *p, PPoint *pFrom, PPoint *pTo){
-  PObj *pObj = pik_find_chopper(p->list, pTo);
+static void pik_autochop(Pik *p, PPoint *pFrom, PPoint *pTo, PObj *pObj){
+  if( pObj==0 || pObj->type->xChop==0 ){
+    pObj = pik_find_chopper(p->list, pTo, pFrom);
+  }
   if( pObj ){
     *pTo = pObj->type->xChop(p, pObj, pFrom);
   }
@@ -4140,8 +4212,8 @@ static void pik_after_adding_attributes(Pik *p, PObj *pObj){
     */
     if( pObj->bChop && pObj->nPath>=2 ){
       int n = pObj->nPath;
-      pik_autochop(p, &pObj->aPath[n-2], &pObj->aPath[n-1]);
-      pik_autochop(p, &pObj->aPath[1], &pObj->aPath[0]);
+      pik_autochop(p, &pObj->aPath[n-2], &pObj->aPath[n-1], pObj->pTo);
+      pik_autochop(p, &pObj->aPath[1], &pObj->aPath[0], pObj->pFrom);
     }
 
     pObj->ptEnter = pObj->aPath[0];
@@ -4236,7 +4308,7 @@ void pik_elist_render(Pik *p, PList *pList){
   int iThisLayer;
   int bMoreToDo;
   int miss = 0;
-  int mDebug = (int)pik_value(p, "debug", 5, 0);
+  int mDebug = pik_value_int(p, "debug", 5, 0);
   PNum colorLabel;
   do{
     bMoreToDo = 0;
@@ -4354,20 +4426,20 @@ static void pik_render(Pik *p, PList *pList){
     margin += thickness;
     wArrow = p->wArrow*thickness;
     miss = 0;
-    p->fgcolor = (int)pik_value(p,"fgcolor",7,&miss);
+    p->fgcolor = pik_value_int(p,"fgcolor",7,&miss);
     if( miss ){
       PToken t;
       t.z = "fgcolor";
       t.n = 7;
-      p->fgcolor = (int)pik_lookup_color(0, &t);
+      p->fgcolor = pik_round(pik_lookup_color(0, &t));
     }
     miss = 0;
-    p->bgcolor = (int)pik_value(p,"bgcolor",7,&miss);
+    p->bgcolor = pik_value_int(p,"bgcolor",7,&miss);
     if( miss ){
       PToken t;
       t.z = "bgcolor";
       t.n = 7;
-      p->bgcolor = (int)pik_lookup_color(0, &t);
+      p->bgcolor = pik_round(pik_lookup_color(0, &t));
     }
 
     /* Compute a bounding box over all objects so that we can know
@@ -4391,14 +4463,14 @@ static void pik_render(Pik *p, PList *pList){
     }
     w = p->bbox.ne.x - p->bbox.sw.x;
     h = p->bbox.ne.y - p->bbox.sw.y;
-    p->wSVG = (int)(p->rScale*w);
-    p->hSVG = (int)(p->rScale*h);
+    p->wSVG = pik_round(p->rScale*w);
+    p->hSVG = pik_round(p->rScale*h);
     pikScale = pik_value(p,"scale",5,0);
     if( pikScale>=0.001 && pikScale<=1000.0
      && (pikScale<0.99 || pikScale>1.01)
     ){
-      p->wSVG = (int)(p->wSVG*pikScale);
-      p->hSVG = (int)(p->hSVG*pikScale);
+      p->wSVG = pik_round(p->wSVG*pikScale);
+      p->hSVG = pik_round(p->hSVG*pikScale);
       pik_append_num(p, " width=\"", p->wSVG);
       pik_append_num(p, "\" height=\"", p->hSVG);
       pik_append(p, "\"", 1);
@@ -5143,11 +5215,12 @@ char *pikchr(
 int LLVMFuzzerTestOneInput(const uint8_t *aData, size_t nByte){
   int w,h;
   char *zIn, *zOut;
+  unsigned int mFlags = nByte & 3;
   zIn = malloc( nByte + 1 );
   if( zIn==0 ) return 0;
   memcpy(zIn, aData, nByte);
   zIn[nByte] = 0;
-  zOut = pikchr(zIn, "pikchr", 0, &w, &h);
+  zOut = pikchr(zIn, "pikchr", mFlags, &w, &h);
   free(zIn);
   free(zOut);
   return 0;
